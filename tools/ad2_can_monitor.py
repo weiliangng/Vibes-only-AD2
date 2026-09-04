@@ -17,6 +17,11 @@ keeps terminal I/O out of the receive path on a busy bus.
 Use --filter one or more times to show/count only selected CAN IDs.  Filtering
 is after capture, so it does not reduce the raw-sample bandwidth requirement.
 
+Standard data frames matching the SCV2 command (`0x067`, DLC 5) and telemetry
+(`0x077`, DLC 8) contracts are decoded in the `Decoded` display column.  Other
+frames, including extended, remote, or wrong-DLC frames with those IDs, remain
+visible as raw CAN traffic.
+
 Run from PowerShell:
   & "$env:LOCALAPPDATA/Programs/Python/Python312/python.exe" tools/ad2_can_monitor.py
 """
@@ -26,6 +31,7 @@ from __future__ import annotations
 import argparse
 import ctypes as ct
 import os
+import struct
 import sys
 import time
 from collections import Counter, deque
@@ -52,6 +58,13 @@ CAN_STATUS = {
 RECORD_MODE = 3
 SAMPLE_FORMAT_BITS = 8
 MAX_RAW_READ_SAMPLES = 16_384
+
+# SCV2 Classic-CAN wire identifiers and payload sizes.  The packet definitions
+# live in scv2/Core/Inc/can_protocol.h and scv2/CAN_TELEMETRY.md.
+SCV2_COMMAND_CAN_ID = 0x067
+SCV2_COMMAND_DLC = 5
+SCV2_TELEMETRY_CAN_ID = 0x077
+SCV2_TELEMETRY_DLC = 8
 
 
 class DwfError(RuntimeError):
@@ -133,6 +146,37 @@ def timestamp() -> str:
     return time.strftime("%H:%M:%S", time.localtime(now // 1_000_000_000)) + f".{now // 1_000_000 % 1_000:03d}"
 
 
+def decode_scv2_frame(identifier: int, extended: bool, remote: bool, dlc: int, payload: bytes) -> str:
+    """Return an engineering-unit summary for a valid SCV2 wire frame."""
+    if extended or remote:
+        return ""
+
+    if identifier == SCV2_COMMAND_CAN_ID and dlc == SCV2_COMMAND_DLC and len(payload) == SCV2_COMMAND_DLC:
+        enable_module, reset, power_limit_w, energy_j = struct.unpack("<BBBH", payload)
+        energy = "disabled (777 J)" if energy_j == 777 else f"{energy_j} J"
+        return f"SCV2 cmd: enable={enable_module} reset=0x{reset:02X} power={power_limit_w} W energy={energy}"
+
+    if identifier == SCV2_TELEMETRY_CAN_ID and dlc == SCV2_TELEMETRY_DLC and len(payload) == SCV2_TELEMETRY_DLC:
+        load_power_dw, vcap_dv, converter_current_da = struct.unpack_from("<HHh", payload)
+        status = payload[7]
+        faults = []
+        if status & 0x01:
+            faults.append("Vbus OVP")
+        if status & 0x02:
+            faults.append("Vcap OVP")
+        fault_text = ", ".join(faults) if faults else "none"
+        reserved_status = status & ~0x03
+        if reserved_status:
+            fault_text += f"; reserved=0x{reserved_status:02X}"
+        reserved_byte = f" reserved=0x{payload[6]:02X}" if payload[6] else ""
+        return (
+            f"SCV2 telemetry: load={load_power_dw / 10:.1f} W vcap={vcap_dv / 10:.1f} V "
+            f"iconv={converter_current_da / 10:.1f} A faults={fault_text}{reserved_byte}"
+        )
+
+    return ""
+
+
 @dataclass
 class CanFrame:
     identifier: int
@@ -160,6 +204,10 @@ class CanFrame:
     @property
     def data(self) -> str:
         return "--" if self.remote or not self.payload else " ".join(f"{byte:02X}" for byte in self.payload)
+
+    @property
+    def decoded(self) -> str:
+        return decode_scv2_frame(self.identifier, self.extended, self.remote, self.dlc, self.payload)
 
 
 class LiveCanDisplay:
@@ -238,13 +286,13 @@ class LiveCanDisplay:
             f"Capture health: {self.capture_health}",
             "",
             f"CAN packets by address ({len(self.frames)} unique, {self.total_frames} total)",
-            "Address      Format  Type  DLC  Data                     Last received   Rate (Hz)  Frames",
-            "-----------  ------  ----  ---  -----------------------  --------------  ---------  ------",
+            "Address      Format  Type  DLC  Data                     Last received   Rate (Hz)  Frames  Decoded",
+            "-----------  ------  ----  ---  -----------------------  --------------  ---------  ------  -------",
         ]
         for frame in self.frames.values():
             lines.append(
                 f"{frame.address:<11}  {frame.format:<6}  {frame.frame_type:<4}  {frame.dlc:>3}  "
-                f"{frame.data:<23.23}  {frame.last_seen:<14}  {frame.rate_hz:>9.1f}  {frame.count:>6}"
+                f"{frame.data:<23.23}  {frame.last_seen:<14}  {frame.rate_hz:>9.1f}  {frame.count:>6}  {frame.decoded}"
             )
         if not self.frames:
             lines.append("(waiting for CAN traffic)")
