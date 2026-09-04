@@ -16,3 +16,7 @@ Authoritative references:
 WaveForms must be installed and closed before starting the program; a device
 can be opened by only one application at a time.
 
+## Hardware connections
+
+Before making any hardware-facing change or measurement, the human must state
+which physical pin is connected to which signal, device, or instrument channel.
