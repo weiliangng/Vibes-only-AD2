@@ -32,9 +32,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: AD2-CAN-Monitor-win64
-          path: |
-            dist/AD2-CAN-Monitor.exe
-            dist/AD2-CAN-Monitor-1.0.0-win64.zip
+          path: dist/AD2-CAN-Monitor.exe
           if-no-files-found: error
 
       - name: Publish tagged GitHub release
@@ -45,7 +43,5 @@ jobs:
         run: |
           gh release create "${{ github.ref_name }}" `
             "dist/AD2-CAN-Monitor.exe#Standalone Windows executable" `
-            "dist/AD2-CAN-Monitor-1.0.0-win64.zip#Windows release package" `
-            "dist/AD2-CAN-Monitor-1.0.0/SHA256SUMS.txt#SHA-256 checksum" `
-            --title "AD2 CAN Monitor 1.0.0" `
+            --title "AD2 CAN Monitor ${{ github.ref_name }}" `
             --generate-notes

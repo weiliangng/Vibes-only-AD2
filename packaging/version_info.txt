@@ -16,11 +16,11 @@ VSVersionInfo(
         u'040904B0',
         [StringStruct(u'CompanyName', u'RoboMaster tools'),
          StringStruct(u'FileDescription', u'Passive Analog Discovery 2 CAN monitor'),
-         StringStruct(u'FileVersion', u'1.0.0'),
+         StringStruct(u'FileVersion', u'1.1.0'),
          StringStruct(u'InternalName', u'AD2-CAN-Monitor'),
          StringStruct(u'OriginalFilename', u'AD2-CAN-Monitor.exe'),
          StringStruct(u'ProductName', u'AD2 CAN Monitor'),
-         StringStruct(u'ProductVersion', u'1.0.0')])
+         StringStruct(u'ProductVersion', u'1.1.0')])
     ]),
     VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
   ]

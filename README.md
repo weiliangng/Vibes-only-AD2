@@ -16,14 +16,7 @@ The Windows executable contains Python and all project code. The only runtime pr
 
 ## How to install
 
-### Which download should I use?
-
-Both release downloads contain the same `AD2-CAN-Monitor.exe` and provide identical monitoring functionality:
-
-- **Standalone executable** — just the EXE, for users who already have these instructions.
-- **Release package ZIP** — the EXE together with this README, the dashboard screenshot and `SHA256SUMS.txt` for integrity verification.
-
-The additional ZIP contents are documentation only; the EXE has no runtime sidecar files. Digilent WaveForms must be installed whichever download you choose.
+Download `AD2-CAN-Monitor.exe` from the latest GitHub release. It is the complete standalone application; there is no ZIP package and no runtime sidecar files. Digilent WaveForms must also be installed.
 
 ### 1. Install WaveForms
 
@@ -56,7 +49,7 @@ The monitor does not transmit or ACK. It can observe a functioning bus whose rea
 
 ### 3. Run the program
 
-Extract `AD2-CAN-Monitor-1.0.0-win64.zip`, then double-click `AD2-CAN-Monitor.exe`. Keep `README.md` for reference; the EXE itself has no runtime sidecar files. With no arguments it uses:
+Double-click `AD2-CAN-Monitor.exe`. With no arguments it uses:
 
 | Setting | Default |
 |---|---:|
@@ -149,16 +142,23 @@ IDs are 11-bit standard Classic CAN unless stated otherwise. The same numeric ID
 | `0x104` | 8 | Inter-DevC gyroscope vector. |
 | `0x105` | 8 | Inter-DevC acceleration vector. |
 | `0x141`–`0x160` | 8 | LK/RMD command or feedback. Known operation bytes include PID, encoder, angle, status, torque, speed and position operations. |
-| `0x1FF` | 8 | DJI motor group command for IDs 5–8, or GM6020 IDs 1–4. Four big-endian signed raw outputs. |
-| `0x200` | 8 | DJI C610/C620 motor group command for IDs 1–4. Four big-endian signed raw outputs. |
-| `0x201`–`0x208` | 8 | DJI C610/C620/GM6020 feedback: encoder angle, RPM, torque/current raw value and temperature/auxiliary byte. Exact motor family is bus-dependent. |
-| `0x209`–`0x20B` | 8 | GM6020 feedback for the upper motor IDs. |
+| `0x1FE` | 8 | GM6020 current-mode command for IDs 1–4: signed torque-current demand in amperes (`±16384` = `±3 A`). |
+| `0x1FF` | 8 | Shared command: C610/C620 torque current for IDs 5–8, or GM6020 voltage demand for IDs 1–4. The decoder shows every valid interpretation. |
+| `0x200` | 8 | C610/C620 torque-current command for IDs 1–4. Because the ID does not identify the controller, both scales are shown: C610 `±10000` = `±10 A`; C620 `±16384` = `±20 A`. |
+| `0x201`–`0x204` | 8 | C610/C620 feedback for IDs 1–4: rotor angle in degrees, rotor RPM, estimated torque current and temperature/auxiliary byte. |
+| `0x205`–`0x208` | 8 | Shared feedback: C610/C620 IDs 5–8 or GM6020 IDs 1–4. Angle and RPM are exact; controller-specific current interpretations are all shown. |
+| `0x209`–`0x20B` | 8 | GM6020 feedback for IDs 5–7: rotor angle, RPM, estimated torque current and temperature. |
 | `0x211`, `0x212`, `0x213` | 8 | 60 V/15 A unidirectional wattmeter revisions: voltage and current in hundredths of SI units. The connected unit was observed on `0x213`; its documentation names `0x212` and older `0x211`. |
 | `0x270` | variable | Reverse-engineered CM01↔PMM segmented stream. The known measurement message is described below. |
-| `0x2FF` | 8 | GM6020 group command for IDs 5–7. |
-| `0x301`–`0x308` | 8 | DM motor DJI-mode feedback: angle, RPM, torque and temperature. |
-| `0x3FE` | 8 | DM DJI-mode group command for IDs 1–4. |
-| `0x4FE` | 8 | DM DJI-mode group command for IDs 5–8. |
+| `0x2FE` | 8 | GM6020 current-mode command for IDs 5–7; bytes 6–7 are reserved. |
+| `0x2FF` | 8 | GM6020 voltage-mode command for IDs 5–7. Voltage demand is shown as percent of the documented `±25000` full scale; bytes 6–7 are reserved. |
+| `0x301`–`0x308` | 8 | DM motor DJI-mode feedback: angle, RPM (wire value is RPM × 100 in the local firmware), torque/current raw value and temperature. |
+| `0x3FE` | 8 | DM DJI-mode torque/current command for IDs 1–4, shown as raw and percent of the local firmware's `±16384` full scale. |
+| `0x4FE` | 8 | DM DJI-mode torque/current command for IDs 5–8, shown as raw and percent of the local firmware's `±16384` full scale. |
+
+The DJI group commands are **not target-RPM messages**. The robot firmware closes its own speed or position loop and sends the resulting torque-producing current/voltage demand. Actual rotor RPM comes back in the motor feedback frames. For C610/M2006 and C620/M3508 feedback, the monitor also estimates gearbox-output RPM using the documented `36:1` and `3591:187` ratios. A single-turn rotor angle cannot be converted into an absolute gearbox-output angle without tracking wraparound over time.
+
+Current values marked with `~` use the command full-scale conversion for the feedback field. The manuals identify that field as actual torque current but do not separately state its numeric scale. Shared IDs therefore show all valid controller interpretations instead of silently choosing one. GM6020 voltage-mode commands are shown as percent full scale because the protocol's voltage demand is not a direct measurement in volts.
 
 ### CM01/PMM `0x270`
 
@@ -228,11 +228,10 @@ End users do not need Python. Developers rebuilding the executable need 64-bit P
 .\build.ps1 -Python "C:\full\path\to\python.exe"
 ```
 
-The script creates `.venv-build`, installs the pinned PyInstaller version, runs the test suite and writes:
+The script creates `.venv-build`, installs the pinned PyInstaller version, runs the test suite and writes the same standalone file published on GitHub:
 
 ```text
 dist\AD2-CAN-Monitor.exe
-dist\AD2-CAN-Monitor-1.0.0-win64.zip
 ```
 
 To run only the tests:

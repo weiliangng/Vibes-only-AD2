@@ -55,7 +55,7 @@ DWF_DLL_PATHS = (
     Path(r"C:\Program Files\Digilent\WaveFormsSDK\lib\dwf.dll"),
 )
 APP_NAME = "AD2 CAN Monitor"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 # DWF CAN receiver status values.  Unknown non-zero statuses are still shown.
 CAN_STATUS = {
@@ -85,13 +85,21 @@ DEVC_IMU_CAN_IDS = {
     0x104: ("gyro", 0.001, "rad/s"),
     0x105: ("accel", 0.002, "m/s^2"),
 }
-DJI_GROUP_COMMANDS = {
-    0x200: "DJI cmd IDs1-4",
-    0x1FF: "DJI cmd IDs5-8 / GM6020 IDs1-4",
-    0x2FF: "GM6020 cmd IDs5-7",
-    0x3FE: "DM DJI-mode cmd IDs1-4",
-    0x4FE: "DM DJI-mode cmd IDs5-8",
-}
+# Command/feedback full-scale values from the supplied DJI manuals. C610 and
+# C620 share IDs but use different current scales, so ambiguous frames retain
+# both interpretations. GM6020 firmware v1.0.11.2 and later also provides the
+# separate 0x1FE/0x2FE current-control commands.
+C610_MAX_CURRENT_RAW = 10_000
+C610_MAX_CURRENT_A = 10.0
+C620_MAX_CURRENT_RAW = 16_384
+C620_MAX_CURRENT_A = 20.0
+M2006_GEAR_RATIO = 36.0
+M3508_GEAR_RATIO = 3591.0 / 187.0
+GM6020_MAX_CURRENT_RAW = 16_384
+GM6020_MAX_CURRENT_A = 3.0
+GM6020_MAX_VOLTAGE_RAW = 25_000
+DM_DJI_MAX_DEMAND_RAW = 16_384
+DM_DJI_RPM_SCALE = 100.0
 # 60 V / 15 A unidirectional wattmeter revisions. The supplied documentation
 # names 0x212 (formerly 0x211); the connected unit is observed on 0x213 with
 # the same payload layout.
@@ -243,18 +251,99 @@ def timestamp() -> str:
     return time.strftime("%H:%M:%S", time.localtime(now // 1_000_000_000)) + f".{now // 1_000_000 % 1_000:03d}"
 
 
+def _scaled_tuple(values: tuple[int, ...], scale: float, digits: int = 2) -> str:
+    return "[" + ",".join(f"{value * scale:.{digits}f}" for value in values) + "]"
+
+
+def _raw_tuple(values: tuple[int, ...]) -> str:
+    return "[" + ",".join(str(value) for value in values) + "]"
+
+
+def _decode_motor_group_command(identifier: int, payload: bytes) -> str:
+    outputs = struct.unpack(">hhhh", payload)
+    raw = _raw_tuple(outputs)
+    c610_a = _scaled_tuple(outputs, C610_MAX_CURRENT_A / C610_MAX_CURRENT_RAW)
+    c620_a = _scaled_tuple(outputs, C620_MAX_CURRENT_A / C620_MAX_CURRENT_RAW)
+
+    if identifier == 0x200:
+        return (
+            f"DJI torque-current cmd IDs1-4: C610={c610_a} A "
+            f"C620={c620_a} A raw={raw}"
+        )
+
+    if identifier == 0x1FF:
+        voltage_percent = _scaled_tuple(outputs, 100.0 / GM6020_MAX_VOLTAGE_RAW, 1)
+        return (
+            f"shared DJI cmd: C610/C620 IDs5-8 current={c610_a}/{c620_a} A; "
+            f"GM6020 IDs1-4 voltage={voltage_percent}%FS; raw={raw}"
+        )
+
+    if identifier in (0x1FE, 0x2FE):
+        count = 4 if identifier == 0x1FE else 3
+        first_id = 1 if identifier == 0x1FE else 5
+        active = outputs[:count]
+        current_a = _scaled_tuple(active, GM6020_MAX_CURRENT_A / GM6020_MAX_CURRENT_RAW, 3)
+        last_id = first_id + count - 1
+        reserved = f" reserved_raw={outputs[3]}" if count == 3 and outputs[3] else ""
+        return (
+            f"GM6020 torque-current cmd IDs{first_id}-{last_id}: "
+            f"current={current_a} A raw={_raw_tuple(active)}{reserved}"
+        )
+
+    if identifier == 0x2FF:
+        active = outputs[:3]
+        voltage_percent = _scaled_tuple(active, 100.0 / GM6020_MAX_VOLTAGE_RAW, 1)
+        reserved = f" reserved_raw={outputs[3]}" if outputs[3] else ""
+        return (
+            f"GM6020 voltage cmd IDs5-7: demand={voltage_percent}%FS "
+            f"raw={_raw_tuple(active)}{reserved}"
+        )
+
+    first_id = 1 if identifier == 0x3FE else 5
+    last_id = first_id + 3
+    demand_percent = _scaled_tuple(outputs, 100.0 / DM_DJI_MAX_DEMAND_RAW, 1)
+    return (
+        f"DM DJI-mode torque/current cmd IDs{first_id}-{last_id}: "
+        f"demand={demand_percent}%FS raw={raw}"
+    )
+
+
 def _decode_dji_feedback(identifier: int, payload: bytes) -> str:
-    angle, rpm, torque = struct.unpack(">Hhh", payload[:6])
+    angle, rpm, current_raw = struct.unpack(">Hhh", payload[:6])
+    angle_degrees = angle * 360.0 / 8192.0
     if 0x209 <= identifier <= 0x20B:
-        family = "GM6020 fb"
-        auxiliary = f"temp={payload[6]} C"
+        motor_id = identifier - 0x204
+        current_a = current_raw * GM6020_MAX_CURRENT_A / GM6020_MAX_CURRENT_RAW
+        reserved = f" reserved=0x{payload[7]:02X}" if payload[7] else ""
+        return (
+            f"GM6020 fb ID{motor_id}: angle={angle_degrees:.2f} deg ({angle}/8192) "
+            f"speed={rpm} rpm torque_current~{current_a:.3f} A "
+            f"raw={current_raw} temp={payload[6]} C{reserved}"
+        )
+
+    c610_a = current_raw * C610_MAX_CURRENT_A / C610_MAX_CURRENT_RAW
+    c620_a = current_raw * C620_MAX_CURRENT_A / C620_MAX_CURRENT_RAW
+    m2006_output_rpm = rpm / M2006_GEAR_RATIO
+    m3508_output_rpm = rpm / M3508_GEAR_RATIO
+    dji_id = identifier - 0x200
+    if identifier <= 0x204:
+        identity = f"C610/C620 fb ID{dji_id}"
+        alternatives = f"C610~{c610_a:.3f} A/C620~{c620_a:.3f} A"
     else:
-        family = "DJI motor fb"
-        # C620 and GM6020 define byte 6 as temperature; the older C610
-        # documentation leaves it unused, and their feedback IDs overlap.
-        auxiliary = f"temp/aux={payload[6]}"
+        gm_id = identifier - 0x204
+        gm6020_a = current_raw * GM6020_MAX_CURRENT_A / GM6020_MAX_CURRENT_RAW
+        identity = f"shared DJI fb: C610/C620 ID{dji_id} or GM6020 ID{gm_id}"
+        alternatives = (
+            f"C610~{c610_a:.3f} A/C620~{c620_a:.3f} A/GM6020~{gm6020_a:.3f} A"
+        )
     reserved = f" reserved=0x{payload[7]:02X}" if payload[7] else ""
-    return f"{family}: angle={angle}/8192 rpm={rpm} torque_raw={torque} {auxiliary}{reserved}"
+    # C620 and GM6020 define byte 6 as temperature. C610 reserves it, and
+    # their feedback identifiers overlap, so the generic label is deliberate.
+    return (
+        f"{identity}: rotor_angle={angle_degrees:.2f} deg ({angle}/8192) "
+        f"rotor_speed={rpm} rpm shaft~M2006:{m2006_output_rpm:.2f}/M3508:{m3508_output_rpm:.2f} rpm "
+        f"torque_current={alternatives} raw={current_raw} temp/aux={payload[6]}{reserved}"
+    )
 
 
 def _decode_dm_mit_feedback(payload: bytes) -> str:
@@ -449,20 +538,21 @@ def decode_can_frame(identifier: int, extended: bool, remote: bool, dlc: int, pa
             f"xyz=({x_raw * scale:.4g},{y_raw * scale:.4g},{z_raw * scale:.4g}) {unit}"
         )
 
-    group_name = DJI_GROUP_COMMANDS.get(identifier)
-    if group_name is not None and dlc == 8:
-        outputs = struct.unpack(">hhhh", payload)
-        return f"{group_name}: raw={outputs}"
+    if identifier in (0x1FE, 0x1FF, 0x200, 0x2FE, 0x2FF, 0x3FE, 0x4FE) and dlc == 8:
+        return _decode_motor_group_command(identifier, payload)
 
     if 0x201 <= identifier <= 0x20B and dlc == 8:
         return _decode_dji_feedback(identifier, payload)
 
     if 0x301 <= identifier <= 0x308 and dlc == 8:
-        angle, rpm, torque = struct.unpack(">Hhh", payload[:6])
+        angle, rpm_x100, torque = struct.unpack(">Hhh", payload[:6])
+        motor_id = identifier - 0x300
+        angle_degrees = angle * 360.0 / 8192.0
         reserved = f" reserved=0x{payload[7]:02X}" if payload[7] else ""
         return (
-            f"DM DJI-mode fb: angle={angle}/8192 rpm={rpm} torque_raw={torque} "
-            f"temp={payload[6]} C{reserved}"
+            f"DM DJI-mode fb ID{motor_id}: angle={angle_degrees:.2f} deg ({angle}/8192) "
+            f"speed={rpm_x100 / DM_DJI_RPM_SCALE:.2f} rpm "
+            f"torque/current_raw={torque} temp={payload[6]} C{reserved}"
         )
 
     # 0x091 is the configured MIT-mode feedback address in the searched robot

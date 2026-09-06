@@ -215,11 +215,38 @@ class CanContractDecoderTests(unittest.TestCase):
         self.assertIn("seq=7 valid=0x07 xyz=(1,-2,3) rad/s", imu)
 
     def test_decodes_motor_group_commands_and_feedback(self) -> None:
-        command = self.decode(0x200, struct.pack(">hhhh", 1, -2, 3, -4))
+        command = self.decode(0x200, struct.pack(">hhhh", 1000, -8192, 0, 16384))
         feedback = self.decode(0x205, struct.pack(">HhhBB", 4096, -120, 55, 42, 0))
 
-        self.assertEqual(command, "DJI cmd IDs1-4: raw=(1, -2, 3, -4)")
-        self.assertIn("angle=4096/8192 rpm=-120 torque_raw=55 temp/aux=42", feedback)
+        self.assertIn("DJI torque-current cmd IDs1-4", command)
+        self.assertIn("C610=[1.00,-8.19,0.00,16.38] A", command)
+        self.assertIn("C620=[1.22,-10.00,0.00,20.00] A", command)
+        self.assertIn("rotor_angle=180.00 deg (4096/8192) rotor_speed=-120 rpm", feedback)
+        self.assertIn("shaft~M2006:-3.33/M3508:-6.25 rpm", feedback)
+        self.assertIn("C610~0.055 A/C620~0.067 A/GM6020~0.010 A", feedback)
+
+    def test_decodes_gm6020_current_and_voltage_modes(self) -> None:
+        current = self.decode(0x1FE, struct.pack(">hhhh", 16384, -8192, 0, 1))
+        voltage = self.decode(0x2FF, struct.pack(">hhhh", 25000, -12500, 0, 7))
+        feedback = self.decode(0x209, struct.pack(">HhhBB", 2048, 320, -8192, 51, 0))
+
+        self.assertIn("GM6020 torque-current cmd IDs1-4", current)
+        self.assertIn("current=[3.000,-1.500,0.000,0.000] A", current)
+        self.assertIn("GM6020 voltage cmd IDs5-7: demand=[100.0,-50.0,0.0]%FS", voltage)
+        self.assertIn("reserved_raw=7", voltage)
+        self.assertIn("GM6020 fb ID5: angle=90.00 deg", feedback)
+        self.assertIn("speed=320 rpm torque_current~-1.500 A", feedback)
+
+    def test_decodes_shared_dji_and_dm_scaled_fields(self) -> None:
+        shared = self.decode(0x1FF, struct.pack(">hhhh", 25000, 0, -12500, 0))
+        dm_command = self.decode(0x3FE, struct.pack(">hhhh", 8192, -16384, 0, 4096))
+        dm_feedback = self.decode(0x302, struct.pack(">HhhBB", 4096, -1234, 77, 40, 0))
+
+        self.assertIn("C610/C620 IDs5-8 current=", shared)
+        self.assertIn("GM6020 IDs1-4 voltage=[100.0,0.0,-50.0,0.0]%FS", shared)
+        self.assertIn("demand=[50.0,-100.0,0.0,25.0]%FS", dm_command)
+        self.assertIn("DM DJI-mode fb ID2: angle=180.00 deg", dm_feedback)
+        self.assertIn("speed=-12.34 rpm torque/current_raw=77", dm_feedback)
 
     def test_decodes_dm_mit_feedback(self) -> None:
         decoded = self.decode(0x091, bytes.fromhex("21 80 00 80 08 00 30 31"))
