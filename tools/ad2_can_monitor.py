@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Passively monitor a CAN bus with a Digilent Analog Discovery 2.
 
-The default raw backend samples the selected digital input, batches the logic
-samples, and decodes standard CAN data frames in Python.  It does not configure
-any CAN transmit pin and does not ACK frames.  The older WaveForms CAN decoder
-is retained as an optional fallback.
+The default raw backend samples the selected digital input, transfers DWF
+value/span compressed records, and decodes standard CAN data frames in Python.
+It does not configure any CAN transmit pin and does not ACK frames. The older
+WaveForms CAN decoder is retained as an optional fallback.
 
 By default it listens for a 1 Mbit/s logic-level CAN RX signal on DIO 7.
 The live display has one row per CAN address.  A row is added only when an
@@ -31,11 +31,13 @@ from __future__ import annotations
 import argparse
 import ctypes as ct
 import os
+import shutil
 import struct
 import sys
 import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import TextIO
 
@@ -58,6 +60,7 @@ CAN_STATUS = {
 RECORD_MODE = 3
 SAMPLE_FORMAT_BITS = 8
 MAX_RAW_READ_SAMPLES = 16_384
+MAX_COMPRESSED_VALUES = 16_384
 
 # SCV2 Classic-CAN wire identifiers and payload sizes.  The packet definitions
 # live in scv2/Core/Inc/can_protocol.h and scv2/CAN_TELEMETRY.md.
@@ -128,6 +131,12 @@ def configure_signatures(dwf: ct.CDLL) -> None:
     dwf.FDwfDigitalInStatusRecord.restype = ct.c_int
     dwf.FDwfDigitalInStatusData.argtypes = [handle, ct.c_void_p, ct.c_int]
     dwf.FDwfDigitalInStatusData.restype = ct.c_int
+    dwf.FDwfDigitalInSampleSensibleSet.argtypes = [handle, ct.c_uint]
+    dwf.FDwfDigitalInSampleSensibleSet.restype = ct.c_int
+    dwf.FDwfDigitalInStatusCompress.argtypes = [handle, int_ptr, int_ptr, int_ptr]
+    dwf.FDwfDigitalInStatusCompress.restype = ct.c_int
+    dwf.FDwfDigitalInStatusCompressed.argtypes = [handle, ct.c_void_p, ct.c_int]
+    dwf.FDwfDigitalInStatusCompressed.restype = ct.c_int
 
 
 def error_message(dwf: ct.CDLL) -> str:
@@ -139,6 +148,28 @@ def error_message(dwf: ct.CDLL) -> str:
 def require(ok: int, dwf: ct.CDLL, operation: str) -> None:
     if not ok:
         raise DwfError(f"{operation} failed: {error_message(dwf)}")
+
+
+@lru_cache(maxsize=8)
+def compressed_run_tables(dio: int) -> tuple[tuple[bytes, ...], tuple[bytes, ...]]:
+    """Return reusable byte strings for every eight-bit compressed span."""
+    mask = 1 << dio
+    return (
+        tuple(bytes(length) for length in range(1, 257)),
+        tuple(bytes((mask,)) * length for length in range(1, 257)),
+    )
+
+
+def expand_compressed_samples(encoded: bytes, dio: int) -> bytes:
+    """Expand DWF eight-bit (value, stable-count-minus-one) pairs."""
+    if len(encoded) % 2:
+        raise DwfError(f"DWF returned an odd compressed-value count ({len(encoded)})")
+    low_runs, high_runs = compressed_run_tables(dio)
+    mask = 1 << dio
+    return b"".join(
+        (high_runs if encoded[index] & mask else low_runs)[encoded[index + 1]]
+        for index in range(0, len(encoded), 2)
+    )
 
 
 def timestamp() -> str:
@@ -219,12 +250,35 @@ class LiveCanDisplay:
         self.dio = dio
         self.filters = filters
         self.frames: dict[tuple[bool, int], CanFrame] = {}
+        self.candidate_rate_times: dict[int, deque[float]] = {}
+        self.candidate_rates: dict[int, float] = {}
         self.errors: Counter[str] = Counter()
         self.last_error = "--"
         self.total_frames = 0
         self.capture_health = "--"
         self._interactive = stream.isatty()
         self.dirty = True
+
+    def add_candidate_headers(self, counts: Counter[int]) -> None:
+        """Update approximate on-wire rates from CRC-independent CAN headers."""
+        now = time.monotonic()
+        cutoff = now - 1.0
+        for identifier, count in counts.items():
+            if self.filters and identifier not in self.filters:
+                continue
+            rate_times = self.candidate_rate_times.setdefault(identifier, deque())
+            rate_times.extend([now] * count)
+
+        for identifier, rate_times in self.candidate_rate_times.items():
+            while len(rate_times) > 1 and rate_times[0] < cutoff:
+                rate_times.popleft()
+            if len(rate_times) > 1:
+                span = rate_times[-1] - rate_times[0]
+                self.candidate_rates[identifier] = (len(rate_times) - 1) / span if span else 0.0
+            else:
+                self.candidate_rates[identifier] = 0.0
+        if counts:
+            self.dirty = True
 
     def start(self) -> None:
         if self._interactive:
@@ -280,19 +334,22 @@ class LiveCanDisplay:
         self.dirty = True
 
     def render(self) -> None:
+        health_lines = self.capture_health.splitlines() or ["--"]
         lines = [
             f"Listening: CAN {self.bitrate / 1_000_000:g} Mbit/s, RX=DIO {self.dio}. Press Ctrl+C to stop.",
             f"Filter: {', '.join(f'0x{identifier:03X}' for identifier in sorted(self.filters)) if self.filters else 'all CAN IDs'}",
-            f"Capture health: {self.capture_health}",
+            f"Capture: {health_lines[0]}",
+            *(f"         {line}" for line in health_lines[1:]),
             "",
             f"CAN packets by address ({len(self.frames)} unique, {self.total_frames} total)",
-            "Address      Format  Type  DLC  Data                     Last received   Rate (Hz)  Frames  Decoded",
-            "-----------  ------  ----  ---  -----------------------  --------------  ---------  ------  -------",
+            "Address      Format  Type  DLC  Data                     Last received   CRC Hz  Header Hz  Frames  Decoded",
+            "-----------  ------  ----  ---  -----------------------  --------------  ------  ---------  ------  -------",
         ]
         for frame in self.frames.values():
             lines.append(
                 f"{frame.address:<11}  {frame.format:<6}  {frame.frame_type:<4}  {frame.dlc:>3}  "
-                f"{frame.data:<23.23}  {frame.last_seen:<14}  {frame.rate_hz:>9.1f}  {frame.count:>6}  {frame.decoded}"
+                f"{frame.data:<23.23}  {frame.last_seen:<14}  {frame.rate_hz:>6.1f}  "
+                f"{self.candidate_rates.get(frame.identifier, 0.0):>9.1f}  {frame.count:>6}  {frame.decoded}"
             )
         if not self.frames:
             lines.append("(waiting for CAN traffic)")
@@ -306,6 +363,10 @@ class LiveCanDisplay:
 
         output = "\n".join(lines)
         if self._interactive:
+            # A wrapped line changes the physical cursor row and corrupts the
+            # next cursor-home redraw. Clear and clip every dashboard line.
+            width = max(20, shutil.get_terminal_size((160, 24)).columns - 1)
+            output = "\n".join(f"\x1b[2K{line[:width]}" for line in lines)
             self.stream.write("\x1b[H" + output + "\x1b[J")
         else:
             # Preserve a useful log when output is redirected instead of a terminal.
@@ -357,6 +418,7 @@ def monitor_decoder(device: int, dio: int, bitrate: float, refresh_hz: float, fi
             )
             if status.value == 1:
                 # Copy before the next API call overwrites the ctypes buffer.
+                display.add_candidate_headers(Counter({identifier.value: 1}))
                 display.add_frame(identifier.value, extended.value, remote.value, dlc.value, bytes(payload[:dlc.value]))
             elif status.value:
                 display.add_error(status.value)
@@ -380,7 +442,13 @@ def monitor_decoder(device: int, dio: int, bitrate: float, refresh_hz: float, fi
 
 
 def monitor_raw(
-    device: int, dio: int, bitrate: float, sample_rate: int, refresh_hz: float, filters: set[int]
+    device: int,
+    dio: int,
+    bitrate: float,
+    sample_rate: int,
+    refresh_hz: float,
+    filters: set[int],
+    compressed: bool,
 ) -> tuple[int, int]:
     """Capture batched DigitalIn samples and feed the Python CAN decoder."""
     if dio > 7:
@@ -396,7 +464,7 @@ def monitor_raw(
         raise DwfError(f"open Analog Discovery 2 failed: {error_message(dwf)}")
 
     display = LiveCanDisplay(sys.stdout, bitrate, dio, filters)
-    total_samples = total_lost = total_corrupt = 0
+    total_samples = total_transfer_values = total_lost = total_corrupt = 0
     decoder: RawCanDecoder | None = None
     try:
         base_rate = ct.c_double()
@@ -417,44 +485,109 @@ def monitor_raw(
         require(dwf.FDwfDigitalInAcquisitionModeSet(handle, ct.c_int(RECORD_MODE)), dwf, "set DigitalIn record mode")
         require(dwf.FDwfDigitalInDividerSet(handle, ct.c_uint(divider)), dwf, "set DigitalIn sample rate")
         require(dwf.FDwfDigitalInSampleFormatSet(handle, ct.c_int(SAMPLE_FORMAT_BITS)), dwf, "set eight-bit sample format")
+        if compressed:
+            require(
+                dwf.FDwfDigitalInSampleSensibleSet(handle, ct.c_uint(1 << dio)),
+                dwf,
+                f"enable DIO {dio} record compression",
+            )
         require(dwf.FDwfDigitalInTriggerPositionSet(handle, ct.c_int(0)), dwf, "set continuous DigitalIn acquisition")
         require(dwf.FDwfDigitalInConfigure(handle, ct.c_int(1), ct.c_int(1)), dwf, "start DigitalIn")
 
         decoder = RawCanDecoder(dio, samples_per_bit)
         data = (ct.c_ubyte * MAX_RAW_READ_SAMPLES)()
+        compressed_data = (ct.c_ubyte * MAX_COMPRESSED_VALUES)()
         state = ct.c_ubyte()
         available = ct.c_int()
         lost = ct.c_int()
         corrupt = ct.c_int()
+        monitor_started = time.perf_counter()
+        decode_seconds = 0.0
         refresh_period = 1.0 / refresh_hz
         next_refresh = time.monotonic() + refresh_period
         display.set_capture_health(
             f"raw DigitalIn: {actual_rate / 1_000_000:g} MHz, {samples_per_bit} samples/bit, "
-            f"buffer {max_buffer.value} samples"
+            f"{'compressed' if compressed else 'uncompressed'}, buffer {max_buffer.value} samples"
         )
         display.start()
 
         while True:
             require(dwf.FDwfDigitalInStatus(handle, ct.c_int(1), ct.byref(state)), dwf, "poll DigitalIn")
-            require(
-                dwf.FDwfDigitalInStatusRecord(handle, ct.byref(available), ct.byref(lost), ct.byref(corrupt)),
-                dwf,
-                "read DigitalIn record status",
-            )
+            if compressed:
+                require(
+                    dwf.FDwfDigitalInStatusCompress(
+                        handle, ct.byref(available), ct.byref(lost), ct.byref(corrupt)
+                    ),
+                    dwf,
+                    "read compressed DigitalIn status",
+                )
+            else:
+                require(
+                    dwf.FDwfDigitalInStatusRecord(
+                        handle, ct.byref(available), ct.byref(lost), ct.byref(corrupt)
+                    ),
+                    dwf,
+                    "read DigitalIn record status",
+                )
             total_lost += lost.value
             total_corrupt += corrupt.value
-            count = min(available.value, MAX_RAW_READ_SAMPLES)
+            if lost.value or corrupt.value:
+                # Never join the tail of one frame to samples from after a FIFO
+                # discontinuity. That creates false candidates and expensive
+                # four-phase searches.
+                decoder.reset_stream()
+
+            count = min(
+                available.value,
+                MAX_COMPRESSED_VALUES if compressed else MAX_RAW_READ_SAMPLES,
+            )
+            if compressed:
+                count -= count % 2  # compressed data are value/span pairs
             if count:
-                require(dwf.FDwfDigitalInStatusData(handle, data, ct.c_int(count)), dwf, "read DigitalIn samples")
-                total_samples += count
-                for frame in decoder.feed(bytes(data[:count])):
+                decode_started = time.perf_counter()
+                if compressed:
+                    require(
+                        dwf.FDwfDigitalInStatusCompressed(handle, compressed_data, ct.c_int(count)),
+                        dwf,
+                        "read compressed DigitalIn samples",
+                    )
+                    total_transfer_values += count
+                    samples = expand_compressed_samples(bytes(compressed_data[:count]), dio)
+                else:
+                    require(
+                        dwf.FDwfDigitalInStatusData(handle, data, ct.c_int(count)),
+                        dwf,
+                        "read DigitalIn samples",
+                    )
+                    total_transfer_values += count
+                    samples = bytes(data[:count])
+                total_samples += len(samples)
+                previous_candidate_ids = decoder.candidate_ids.copy()
+                decoded_frames = decoder.feed(samples)
+                display.add_candidate_headers(decoder.candidate_ids - previous_candidate_ids)
+                for frame in decoded_frames:
                     display.add_frame(frame.identifier, 0, 0, frame.dlc, frame.payload)
+                decode_seconds += time.perf_counter() - decode_started
 
             now = time.monotonic()
             if now >= next_refresh:
+                transfer = (
+                    f"compressed values {total_transfer_values} "
+                    f"({total_samples / max(1, total_transfer_values):.1f}x)"
+                    if compressed
+                    else f"transfer samples {total_transfer_values}"
+                )
+                decode_load = 100.0 * decode_seconds / max(1e-9, time.perf_counter() - monitor_started)
+                valid_frames = sum(decoder.frames.values())
+                rejected_frames = decoder.bad_crc + decoder.decode_errors + decoder.unsupported
+                valid_yield = 100.0 * valid_frames / max(1, valid_frames + rejected_frames)
+                fallback_hits = sum(decoder.phase_hits.values())
                 display.set_capture_health(
-                    f"raw {actual_rate / 1_000_000:g} MHz; samples {total_samples}; lost {total_lost}; "
-                    f"corrupt {total_corrupt}; bad CRC {decoder.bad_crc}; resyncs {decoder.resyncs}"
+                    f"raw {actual_rate / 1_000_000:g} MHz; expanded samples {total_samples}; {transfer}\n"
+                    f"continuity: lost {total_lost}; corrupt {total_corrupt}; bad CRC {decoder.bad_crc}; "
+                    f"decode errors {decoder.decode_errors}; candidate yield {valid_yield:.1f}%\n"
+                    f"decoder: load {decode_load:.0f}%; resyncs {decoder.resyncs}; "
+                    f"vote hits {decoder.majority_hits}; fallback hits {fallback_hits}"
                 )
                 if display.dirty:
                     display.render()
@@ -462,7 +595,7 @@ def monitor_raw(
     except KeyboardInterrupt:
         raw_errors = total_lost + total_corrupt
         if decoder is not None:
-            raw_errors += decoder.bad_crc + decoder.resyncs
+            raw_errors += decoder.bad_crc + decoder.decode_errors
         return display.total_frames, raw_errors
     finally:
         if display.dirty:
@@ -484,6 +617,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sample-rate", type=int, default=4_000_000,
         help="raw-backend DigitalIn sample rate in Hz (default: 4000000)",
+    )
+    parser.add_argument(
+        "--uncompressed", action="store_true",
+        help="disable DWF value/span record compression for troubleshooting",
     )
     parser.add_argument(
         "--filter", dest="filters", type=lambda value: int(value, 0), action="append", default=[], metavar="CAN_ID",
@@ -514,7 +651,7 @@ if __name__ == "__main__":
         if arguments.backend == "raw":
             received, errors = monitor_raw(
                 arguments.device, arguments.dio, arguments.bitrate, arguments.sample_rate,
-                arguments.refresh_hz, arguments.filters,
+                arguments.refresh_hz, arguments.filters, not arguments.uncompressed,
             )
             print(f"Stopped. Matching frames received: {received}; raw capture issues: {errors}.")
         else:

@@ -119,12 +119,38 @@ class RawCanDecoder:
     def __init__(self, dio: int, samples_per_bit: int) -> None:
         self._dio_mask = 1 << dio
         self.samples_per_bit = samples_per_bit
+        # A valid SOF is preceded by ACK delimiter + seven EOF bits + three
+        # intermission bits: at least eleven contiguous recessive bits. Using
+        # only intermission wrongly treats legal five-bit runs inside a damaged
+        # frame as fresh SOFs. Allow one sample of edge quantization uncertainty.
+        self._minimum_idle_samples = max(1, 11 * samples_per_bit - 1)
         self._to_level = bytes(1 if value & self._dio_mask else 0 for value in range(256))
         self._samples = bytearray()
         self.frames: Counter[int] = Counter()
         self.bad_crc = 0
         self.unsupported = 0
+        self.decode_errors = 0
         self.resyncs = 0
+        self.majority_hits = 0
+        self.phase_hits: Counter[int] = Counter()
+        self.sof_candidates = 0
+        self.candidate_ids: Counter[int] = Counter()
+
+        if samples_per_bit < 4:
+            raise ValueError("CAN decoding requires at least four samples per bit")
+
+        # Vote across the bit cell to reject an isolated threshold glitch.
+        # An early-phase retry recovers edge-aligned cells cheaply. If either
+        # attempt gets all the way to a CRC mismatch, one middle-phase retry
+        # is worthwhile; malformed headers do not pay that extra CPU cost.
+        preferred_phase = min(samples_per_bit - 1, max(0, round(samples_per_bit * 0.7 - 0.5)))
+        self.preferred_phase = preferred_phase
+        self._vote_phases = (0, preferred_phase, samples_per_bit - 1)
+        self._sample_phases = [0, max(1, preferred_phase - 1)]
+
+    def reset_stream(self) -> None:
+        """Discard an incomplete frame after a capture discontinuity."""
+        self._samples.clear()
 
     def feed(self, samples: bytes) -> list[CanFrame]:
         """Add raw eight-bit samples and return all complete, valid CAN frames."""
@@ -135,27 +161,89 @@ class RawCanDecoder:
         while True:
             start = self._samples.find(0, scan_from)
             if start < 0:
-                # Keep a small idle tail so a falling edge spanning two blocks
-                # remains detectable without allowing an unbounded idle buffer.
-                del self._samples[:-2]
+                # Retain enough idle history to recognize an SOF that arrives
+                # in the next capture block.
+                keep = self._minimum_idle_samples + 1
+                if len(self._samples) > keep:
+                    del self._samples[:-keep]
                 return result
             if self._samples[start - 1] != 1:
                 scan_from = start + 1
                 continue
+            if (
+                start < self._minimum_idle_samples
+                or self._samples.find(0, start - self._minimum_idle_samples, start) >= 0
+            ):
+                # Falling edges inside a frame are resynchronization edges,
+                # not possible SOFs. Skipping them prevents four expensive
+                # phase attempts for every corrupt frame fragment.
+                scan_from = start + 1
+                continue
 
-            decoded = self._decode_at(start)
-            if decoded is None:
+            decoded = None
+            incomplete = False
+            failures: list[str] = []
+            attempted_identifiers: list[int] = []
+            candidate = self._decode_at(start, None)
+            if candidate is None:
+                incomplete = True
+            elif candidate[0] is not None:
+                decoded = candidate
+                self.majority_hits += 1
+            else:
+                failures.append(candidate[2])
+                if candidate[4] is not None:
+                    attempted_identifiers.append(candidate[4])
+
+            for phase_index, phase in enumerate(self._sample_phases):
+                if decoded is not None:
+                    break
+                if phase_index and "crc" not in failures:
+                    break
+                candidate = self._decode_at(start, phase)
+                if candidate is None:
+                    incomplete = True
+                    continue
+                if candidate[0] is not None:
+                    decoded = candidate
+                    self.phase_hits[phase] += 1
+                    break
+                failures.append(candidate[2])
+                if candidate[4] is not None:
+                    attempted_identifiers.append(candidate[4])
+
+            if decoded is None and incomplete:
                 # The current block may end in the middle of this candidate.
-                del self._samples[:start - 1]
+                del self._samples[:start - self._minimum_idle_samples]
                 return result
 
-            frame, end, reason = decoded
+            self.sof_candidates += 1
+            if decoded is not None and decoded[0] is not None:
+                self.candidate_ids[decoded[0].identifier] += 1
+            elif attempted_identifiers:
+                identifier = Counter(attempted_identifiers).most_common(1)[0][0]
+                self.candidate_ids[identifier] += 1
+
+            if decoded is None:
+                # Count a rejected edge once, not once per attempted phase.
+                reason = "extended" if "extended" in failures else "crc" if "crc" in failures else "decode"
+                if reason == "crc":
+                    self.bad_crc += 1
+                elif reason == "extended":
+                    self.unsupported += 1
+                else:
+                    self.decode_errors += 1
+                scan_from = start + self.samples_per_bit
+                continue
+
+            frame, end, reason, timing_resyncs, _identifier = decoded
             if frame is not None:
                 result.append(frame)
                 self.frames[frame.identifier] += 1
-                # Retain one recessive sample before the next candidate; a
-                # back-to-back frame may start at the very next sample.
-                del self._samples[:end - 1]
+                self.resyncs += timing_resyncs
+                # The decoded trailer includes intermission. Retain it so an
+                # immediately following frame still has a recognizable SOF.
+                del self._samples[:max(0, end - self._minimum_idle_samples)]
                 scan_from = 1
             else:
                 if reason == "crc":
@@ -163,24 +251,73 @@ class RawCanDecoder:
                 elif reason == "extended":
                     self.unsupported += 1
                 else:
-                    self.resyncs += 1
+                    self.decode_errors += 1
                 # Avoid retrying every low sample inside a failed candidate.
                 scan_from = start + self.samples_per_bit
 
-    def _decode_at(self, start: int) -> tuple[CanFrame | None, int, str] | None:
+    def _decode_at(
+        self, start: int, sample_phase: int | None
+    ) -> tuple[CanFrame | None, int, str, int, int | None] | None:
         """Decode at a falling edge; None means more samples are required."""
+        samples = self._samples
+        sample_count = len(samples)
+        samples_per_bit = self.samples_per_bit
+        vote_phase_0, vote_phase_1, vote_phase_2 = self._vote_phases
+        max_adjustment = max(1, samples_per_bit // 4)
         raw_index = 0
+        anchor_index = 0
+        anchor_sample = start
+        timing_resyncs = 0
         last_bit: int | None = None
         run_length = 0
         protected_bits: list[int] = []
 
         def raw_bit() -> int | None:
-            nonlocal raw_index
-            center = start + (raw_index * self.samples_per_bit) + self.samples_per_bit // 2
-            if center >= len(self._samples):
-                return None
+            nonlocal raw_index, anchor_index, anchor_sample, timing_resyncs
+            boundary = anchor_sample + (raw_index - anchor_index) * samples_per_bit
+
+            if raw_index:
+                # CAN receivers resynchronize on recessive-to-dominant edges.
+                # Bound each correction so noise cannot move the decoder
+                # arbitrarily far through a frame.
+                at_boundary = (
+                    0 < boundary < sample_count
+                    and samples[boundary - 1] == 1
+                    and samples[boundary] == 0
+                )
+                if not at_boundary:
+                    edge = None
+                    for adjustment in range(1, max_adjustment + 1):
+                        early = boundary - adjustment
+                        if 0 < early < sample_count and samples[early - 1] == 1 and samples[early] == 0:
+                            edge = early
+                            break
+                        late = boundary + adjustment
+                        if 0 < late < sample_count and samples[late - 1] == 1 and samples[late] == 0:
+                            edge = late
+                            break
+                    if edge is not None:
+                        anchor_index = raw_index
+                        anchor_sample = edge
+                        boundary = edge
+                        timing_resyncs += 1
+
+            if sample_phase is None:
+                if boundary + vote_phase_2 >= sample_count:
+                    return None
+                ones = (
+                    samples[boundary + vote_phase_0]
+                    + samples[boundary + vote_phase_1]
+                    + samples[boundary + vote_phase_2]
+                )
+                value = int(ones >= 2)
+            else:
+                sample = boundary + sample_phase
+                if sample >= sample_count:
+                    return None
+                value = samples[sample]
             raw_index += 1
-            return self._samples[center]
+            return value
 
         def destuffed_bit() -> int | None:
             nonlocal last_bit, run_length
@@ -216,40 +353,40 @@ class RawCanDecoder:
         if header is None:
             return None
         if not header or header[0] != 0:
-            return None, start + self.samples_per_bit, "resync"
-        if header[13]:
-            return None, start + self.samples_per_bit, "extended"
+            return None, start + self.samples_per_bit, "decode", timing_resyncs, None
 
         identifier = 0
         for bit in header[1:12]:
             identifier = (identifier << 1) | bit
+        if header[13]:
+            return None, start + self.samples_per_bit, "extended", timing_resyncs, identifier
         dlc = sum(bit << (3 - index) for index, bit in enumerate(header[15:19]))
         if dlc > 8 or header[12]:  # RTR frames are intentionally not decoded in this prototype.
-            return None, start + self.samples_per_bit, "resync"
+            return None, start + self.samples_per_bit, "decode", timing_resyncs, identifier
 
         data_bits = protected(dlc * 8)
         crc_bits = protected(15)
         if data_bits is None or crc_bits is None:
             return None
-        if not data_bits or not crc_bits:
-            return None, start + self.samples_per_bit, "resync"
+        if not crc_bits:
+            return None, start + self.samples_per_bit, "decode", timing_resyncs, identifier
         received_crc = sum(bit << (14 - index) for index, bit in enumerate(crc_bits))
         if crc15(protected_bits[:-15]) != received_crc:
-            return None, start + self.samples_per_bit, "crc"
+            return None, start + self.samples_per_bit, "crc", timing_resyncs, identifier
 
         # CRC delimiter, ACK slot/delimiter, EOF, and intermission are not stuffed.
         trailer = [raw_bit() for _ in range(13)]
         if any(bit is None for bit in trailer):
             return None
         if trailer[0] != 1 or trailer[2] != 1 or trailer[3:10] != [1] * 7:
-            return None, start + self.samples_per_bit, "resync"
+            return None, start + self.samples_per_bit, "decode", timing_resyncs, identifier
 
         payload = bytes(
             sum(data_bits[byte * 8 + offset] << (7 - offset) for offset in range(8))
             for byte in range(dlc)
         )
-        end = start + raw_index * self.samples_per_bit
-        return CanFrame(identifier, dlc, payload), end, "ok"
+        end = anchor_sample + (raw_index - anchor_index) * samples_per_bit
+        return CanFrame(identifier, dlc, payload), end, "ok", timing_resyncs, identifier
 
 
 def monitor(device: int, dio: int, bitrate: int, sample_rate: int, refresh_hz: float) -> None:
@@ -309,10 +446,13 @@ def monitor(device: int, dio: int, bitrate: int, sample_rate: int, refresh_hz: f
             now = time.monotonic()
             if now >= next_report:
                 frame_summary = " ".join(f"0x{identifier:03X}={count}" for identifier, count in decoder.frames.items())
+                phase_summary = "/".join(str(decoder.phase_hits[phase]) for phase in range(samples_per_bit))
                 print(
                     f"frames: {sum(decoder.frames.values())} ({frame_summary or 'none'}); "
                     f"samples: {total_samples}; lost: {total_lost}; corrupt: {total_corrupt}; "
-                    f"bad CRC: {decoder.bad_crc}; resyncs: {decoder.resyncs}; extended: {decoder.unsupported}",
+                    f"bad CRC: {decoder.bad_crc}; decode errors: {decoder.decode_errors}; "
+                    f"timing resyncs: {decoder.resyncs}; phase hits [0..{samples_per_bit - 1}]: {phase_summary}; "
+                    f"extended: {decoder.unsupported}",
                     flush=True,
                 )
                 next_report = now + (1.0 / refresh_hz)
