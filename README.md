@@ -16,6 +16,15 @@ The Windows executable contains Python and all project code. The only runtime pr
 
 ## How to install
 
+### Which download should I use?
+
+Both release downloads contain the same `AD2-CAN-Monitor.exe` and provide identical monitoring functionality:
+
+- **Standalone executable** — just the EXE, for users who already have these instructions.
+- **Release package ZIP** — the EXE together with this README, the dashboard screenshot and `SHA256SUMS.txt` for integrity verification.
+
+The additional ZIP contents are documentation only; the EXE has no runtime sidecar files. Digilent WaveForms must be installed whichever download you choose.
+
 ### 1. Install WaveForms
 
 Install the 64-bit Windows version of [Digilent WaveForms](https://digilent.com/reference/software/waveforms/waveforms-3/previous-versions). The WaveForms installation includes the SDK library used by this monitor. Digilent also documents the SDK and installation layout in its [WaveForms SDK getting-started guide](https://digilent.com/reference/test-and-measurement/guides/waveforms-sdk-getting-started).
