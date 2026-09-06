@@ -1,0 +1,51 @@
+name: Build and release Windows executable
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+
+      - name: Build and test
+        shell: pwsh
+        run: .\build.ps1 -Python (Get-Command python).Source
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AD2-CAN-Monitor-win64
+          path: |
+            dist/AD2-CAN-Monitor.exe
+            dist/AD2-CAN-Monitor-1.0.0-win64.zip
+          if-no-files-found: error
+
+      - name: Publish tagged GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" `
+            "dist/AD2-CAN-Monitor.exe#Standalone Windows executable" `
+            "dist/AD2-CAN-Monitor-1.0.0-win64.zip#Windows release package" `
+            "dist/AD2-CAN-Monitor-1.0.0/SHA256SUMS.txt#SHA-256 checksum" `
+            --title "AD2 CAN Monitor 1.0.0" `
+            --generate-notes

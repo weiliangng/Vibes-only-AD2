@@ -52,6 +52,12 @@ $archive = Join-Path $projectRoot "dist\AD2-CAN-Monitor-1.0.0-win64.zip"
 New-Item -ItemType Directory -Force -Path $releaseDirectory | Out-Null
 Copy-Item -LiteralPath $exe -Destination (Join-Path $releaseDirectory "AD2-CAN-Monitor.exe") -Force
 Copy-Item -LiteralPath (Join-Path $projectRoot "README.md") -Destination (Join-Path $releaseDirectory "README.md") -Force
+$releaseImageDirectory = Join-Path $releaseDirectory "docs\images"
+New-Item -ItemType Directory -Force -Path $releaseImageDirectory | Out-Null
+Copy-Item `
+    -LiteralPath (Join-Path $projectRoot "docs\images\ad2-can-monitor-dashboard.png") `
+    -Destination (Join-Path $releaseImageDirectory "ad2-can-monitor-dashboard.png") `
+    -Force
 $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash
 Set-Content -LiteralPath (Join-Path $releaseDirectory "SHA256SUMS.txt") -Value "$hash  AD2-CAN-Monitor.exe" -Encoding Ascii
 Compress-Archive -Path (Join-Path $releaseDirectory "*") -DestinationPath $archive -CompressionLevel Optimal -Force

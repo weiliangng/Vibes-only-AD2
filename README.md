@@ -94,6 +94,10 @@ The raw backend supports DIO 0 through DIO 7. Its sample rate must resolve to an
 
 ### Reading the dashboard
 
+![AD2 CAN Monitor live dashboard showing capture health, packet rates and decoded CAN IDs](docs/images/ad2-can-monitor-dashboard.png)
+
+The live view above shows a sustained busy-bus capture with zero lost or corrupt samples. `CRC Hz` counts fully validated packets, while `Header Hz` helps expose packets rejected later in decoding.
+
 ```text
 CAN packets by address (6 unique, 78483 total)
 Address  Format Type DLC Data                     Last received  CRC Hz Header Hz Frames Decoded
