@@ -41,7 +41,7 @@ CAN bus ── CAN transceiver ── RXD logic output ── AD2 DIO 7
 Quick hack: connect the black can wire directly the DIO pin 7, and pray nobody has secretly swapped the pins LOL, make sure its CAN_L if you are paranoid and don't want to fry a neat bit of kit
 If the target controller exposes its CAN_RX logic signal, DIO 7 can tap that signal directly. Otherwise, use a CAN transceiver or suitable comparator as a passive receiver.
 
-> Do not connect an AD2 digital pin directly to CAN_H or CAN_L. CAN is differential, while DIO 7 is a single-ended logic input. Direct attachment is electrically and logically unreliable and may exceed the digital input's intended range.
+Note/warning/disclaimer :CAN is differential, while DIO 7 is a single-ended logic input. Direct attachment is electrically and logically unreliable and may exceed the digital input's intended range.
 
 The monitor does not transmit or ACK. It can observe a functioning bus whose real nodes provide acknowledgements. If there is only one transmitter and this passive monitor, the transmitter may continuously retry because nobody asserts the ACK bit.
 
