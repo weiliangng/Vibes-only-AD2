@@ -17,12 +17,14 @@ keeps terminal I/O out of the receive path on a busy bus.
 Use --filter one or more times to show/count only selected CAN IDs.  Filtering
 is after capture, so it does not reduce the raw-sample bandwidth requirement.
 
-Standard data frames matching the SCV2 command (`0x067`, DLC 5) and telemetry
-(`0x077`, DLC 8) contracts are decoded in the `Decoded` display column.  Other
-frames, including extended, remote, or wrong-DLC frames with those IDs, remain
-visible as raw CAN traffic.
+Known standard data frames from the local robot firmware, SCV2, Faster_Supercap,
+and RoboMaster motor contracts are decoded in the `Decoded` display column.
+Extended, remote, wrong-DLC, and unknown frames remain visible as raw traffic.
 
-Run from PowerShell:
+Run the packaged application from PowerShell:
+  AD2-CAN-Monitor.exe
+
+Run from source:
   & "$env:LOCALAPPDATA/Programs/Python/Python312/python.exe" tools/ad2_can_monitor.py
 """
 
@@ -30,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes as ct
+import math
 import os
 import shutil
 import struct
@@ -51,6 +54,8 @@ DWF_DLL_PATHS = (
     Path(r"C:\Program Files\Digilent\WaveForms3\dwf.dll"),
     Path(r"C:\Program Files\Digilent\WaveFormsSDK\lib\dwf.dll"),
 )
+APP_NAME = "AD2 CAN Monitor"
+APP_VERSION = "1.0.0"
 
 # DWF CAN receiver status values.  Unknown non-zero statuses are still shown.
 CAN_STATUS = {
@@ -69,9 +74,70 @@ SCV2_COMMAND_DLC = 5
 SCV2_TELEMETRY_CAN_ID = 0x077
 SCV2_TELEMETRY_DLC = 8
 
+# Contracts recovered from robot_firmware's CAN callbacks/tasks across all local
+# and origin branches.  IDs shared by several motor models intentionally retain
+# generic family names: a passive single-bus capture cannot determine the model.
+DEVC_CHASSIS_COMMAND_CAN_ID = 0x100
+DEVC_STATUS_CAN_ID = 0x101
+DEVC_ODOMETRY_CAN_ID = 0x102
+DEVC_IMU_CAN_IDS = {
+    0x103: ("attitude", 0.0001, "rad"),
+    0x104: ("gyro", 0.001, "rad/s"),
+    0x105: ("accel", 0.002, "m/s^2"),
+}
+DJI_GROUP_COMMANDS = {
+    0x200: "DJI cmd IDs1-4",
+    0x1FF: "DJI cmd IDs5-8 / GM6020 IDs1-4",
+    0x2FF: "GM6020 cmd IDs5-7",
+    0x3FE: "DM DJI-mode cmd IDs1-4",
+    0x4FE: "DM DJI-mode cmd IDs5-8",
+}
+# 60 V / 15 A unidirectional wattmeter revisions. The supplied documentation
+# names 0x212 (formerly 0x211); the connected unit is observed on 0x213 with
+# the same payload layout.
+WATTMETER_CAN_IDS = {0x211, 0x212, 0x213}
+CM01_PMM_CAN_ID = 0x270
+LK_RMD_OPCODES = {
+    0x19: "zero motor",
+    0x30: "read PID",
+    0x31: "write PID RAM",
+    0x32: "write PID ROM",
+    0x33: "read acceleration",
+    0x80: "close motor",
+    0x81: "stop motor",
+    0x88: "resume motor",
+    0x90: "read encoder",
+    0x91: "write encoder zero",
+    0x92: "read multi-turn angle",
+    0x94: "read single-turn angle",
+    0x95: "clear motor angle",
+    0x9A: "read status 1",
+    0x9B: "clear errors",
+    0x9C: "status 2",
+    0x9D: "status 3",
+    0xA1: "torque control",
+    0xA2: "speed control",
+    0xA3: "multi-turn position",
+    0xA4: "multi-turn position",
+    0xA5: "single-turn position",
+    0xA6: "single-turn position",
+}
+
 
 class DwfError(RuntimeError):
     """An error returned by the WaveForms DWF library."""
+
+
+def prepare_windows_console() -> None:
+    """Enable ANSI dashboard rendering when launched directly on Windows."""
+    if os.name != "nt" or not sys.stdout.isatty():
+        return
+    kernel32 = ct.windll.kernel32
+    output_handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+    mode = ct.c_uint()
+    if output_handle and kernel32.GetConsoleMode(output_handle, ct.byref(mode)):
+        kernel32.SetConsoleMode(output_handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    kernel32.SetConsoleTitleW(APP_NAME)
 
 
 def load_dwf() -> ct.CDLL:
@@ -177,9 +243,146 @@ def timestamp() -> str:
     return time.strftime("%H:%M:%S", time.localtime(now // 1_000_000_000)) + f".{now // 1_000_000 % 1_000:03d}"
 
 
-def decode_scv2_frame(identifier: int, extended: bool, remote: bool, dlc: int, payload: bytes) -> str:
-    """Return an engineering-unit summary for a valid SCV2 wire frame."""
-    if extended or remote:
+def _decode_dji_feedback(identifier: int, payload: bytes) -> str:
+    angle, rpm, torque = struct.unpack(">Hhh", payload[:6])
+    if 0x209 <= identifier <= 0x20B:
+        family = "GM6020 fb"
+        auxiliary = f"temp={payload[6]} C"
+    else:
+        family = "DJI motor fb"
+        # C620 and GM6020 define byte 6 as temperature; the older C610
+        # documentation leaves it unused, and their feedback IDs overlap.
+        auxiliary = f"temp/aux={payload[6]}"
+    reserved = f" reserved=0x{payload[7]:02X}" if payload[7] else ""
+    return f"{family}: angle={angle}/8192 rpm={rpm} torque_raw={torque} {auxiliary}{reserved}"
+
+
+def _decode_dm_mit_feedback(payload: bytes) -> str:
+    motor_id = payload[0] & 0x0F
+    state = payload[0] >> 4
+    position_raw = (payload[1] << 8) | payload[2]
+    velocity_raw = (payload[3] << 4) | (payload[4] >> 4)
+    torque_raw = ((payload[4] & 0x0F) << 8) | payload[5]
+    position = position_raw * (8.0 * math.pi) / 65535.0 - 4.0 * math.pi
+    velocity = velocity_raw * 90.0 / 4095.0 - 45.0
+    torque = torque_raw * 36.0 / 4095.0 - 18.0
+    return (
+        f"DM MIT fb: id={motor_id} state={state} pos={position:.3f} rad "
+        f"vel={velocity:.2f} rad/s torque={torque:.2f} Nm Tmos={payload[6]} C Tcoil={payload[7]} C"
+    )
+
+
+def _decode_lk_rmd(payload: bytes) -> str:
+    opcode = payload[0]
+    operation = LK_RMD_OPCODES.get(opcode)
+    if operation is None:
+        return f"LK/RMD motor: opcode=0x{opcode:02X}"
+
+    if opcode == 0x9C and any(payload[1:]):
+        torque, speed_dps, angle = struct.unpack_from("<hhH", payload, 2)
+        return (
+            f"LK/RMD status2: temp={payload[1]} C torque_raw={torque} "
+            f"speed={speed_dps} dps angle={angle}/65536"
+        )
+    if opcode == 0xA2 and payload[1:4] == bytes(3):
+        speed_dps = struct.unpack_from("<i", payload, 4)[0] / 100.0
+        return f"LK/RMD speed cmd: {speed_dps:.2f} dps"
+    if opcode == 0xA1 and payload[1:4] == bytes(3) and payload[6:] == bytes(2):
+        torque_raw = struct.unpack_from("<h", payload, 4)[0]
+        return f"LK/RMD torque cmd: raw={torque_raw}"
+    return f"LK/RMD motor: {operation} (0x{opcode:02X})"
+
+
+def _dji_crc8(data: bytes, seed: int = 119) -> int:
+    """Return the reflected DJI packet-header CRC-8 (poly 0x31)."""
+    crc = seed
+    for value in data:
+        crc ^= value
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0x8C if crc & 1 else crc >> 1
+    return crc
+
+
+def _cm01_crc16(data: bytes, seed: int = 0x1862) -> int:
+    """Return the observed CM01 message CRC-16 (reflected poly 0x1021)."""
+    crc = seed
+    for value in data:
+        crc ^= value
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0x8408 if crc & 1 else crc >> 1
+    return crc
+
+
+class Cm01PmmReassembler:
+    """Reassemble observed DJI CM01/PMM messages fragmented over CAN ID 0x270.
+
+    The measurement message is 30 bytes split 8/8/8/6. Its first four bytes
+    are a DJI-style header: 0x5A, a 13-byte payload length, protocol marker
+    0x10, and the standard DJI header CRC-8. Its final two bytes are a
+    message-level CRC-16 using observed seed 0x1862. Losing one CAN fragment
+    abandons only that message; the next CRC-valid header starts cleanly.
+
+    The three little-endian floats were recovered from live traffic. Voltage
+    is confirmed independently against the capacitor-bank voltage. A live
+    drain/charge test showed that the second and third floats are separate
+    positive discharge- and charge-current magnitudes: only the second rises
+    while capacitor voltage falls, and only the third rises while it rises.
+    Signed net capacitor current is therefore charge minus discharge.
+    """
+
+    START = bytes((0x5A, 0x0D, 0x10))
+    MESSAGE_LENGTH = 30
+
+    def __init__(self) -> None:
+        self._buffer = bytearray()
+
+    @classmethod
+    def _is_start(cls, payload: bytes) -> bool:
+        return (
+            len(payload) == 8
+            and payload.startswith(cls.START)
+            and payload[3] == _dji_crc8(payload[:3])
+        )
+
+    def feed(self, payload: bytes) -> str | None:
+        if self._is_start(payload):
+            self._buffer = bytearray(payload)
+            return None
+        if not self._buffer:
+            return None
+
+        self._buffer.extend(payload)
+        if len(self._buffer) < self.MESSAGE_LENGTH:
+            return None
+        if len(self._buffer) != self.MESSAGE_LENGTH:
+            self._buffer.clear()
+            return None
+
+        packet = bytes(self._buffer)
+        self._buffer.clear()
+        if (
+            packet[13:15] != bytes((0x09, 0x1A))
+            or _cm01_crc16(packet[:-2]) != int.from_bytes(packet[-2:], "little")
+        ):
+            return None
+
+        voltage_v, discharge_current_a, charge_current_a = struct.unpack_from("<fff", packet, 15)
+        if not all(math.isfinite(value) for value in (voltage_v, discharge_current_a, charge_current_a)):
+            return None
+        route = struct.unpack_from("<H", packet, 6)[0]
+        sequence = struct.unpack_from("<H", packet, 10)[0]
+        net_current_a = charge_current_a - discharge_current_a
+        return (
+            f"CM01/PMM type=09/1A: voltage={voltage_v:.3f} V "
+            f"net_current={net_current_a:+.4f} A (+charge) "
+            f"charge={charge_current_a:.4f} A discharge={discharge_current_a:.4f} A "
+            f"status=0x{packet[27]:02X} route=0x{route:04X} seq={sequence}"
+        )
+
+
+def decode_can_frame(identifier: int, extended: bool, remote: bool, dlc: int, payload: bytes) -> str:
+    """Return an evidence-backed summary for a known valid Classic-CAN frame."""
+    if extended or remote or len(payload) != dlc:
         return ""
 
     if identifier == SCV2_COMMAND_CAN_ID and dlc == SCV2_COMMAND_DLC and len(payload) == SCV2_COMMAND_DLC:
@@ -205,7 +408,89 @@ def decode_scv2_frame(identifier: int, extended: bool, remote: bool, dlc: int, p
             f"iconv={converter_current_da / 10:.1f} A faults={fault_text}{reserved_byte}"
         )
 
+    # Faster_Supercap's legacy 0x077 contract is unambiguous by its DLC 6.
+    if identifier == SCV2_TELEMETRY_CAN_ID and dlc == 6:
+        chassis_power_w, error, energy_raw = struct.unpack("<fBB", payload)
+        error_names = {
+            0: "none",
+            1: "cap peak below required",
+            2: "SWEN low",
+            3: "RVSOFF low",
+        }
+        error_text = error_names.get(error, f"unknown({error})")
+        return (
+            f"legacy supercap: power={chassis_power_w:.1f} W error={error_text} "
+            f"energy={energy_raw}/255 ({energy_raw * 100.0 / 255.0:.1f}%)"
+        )
+
+    if identifier == DEVC_CHASSIS_COMMAND_CAN_ID and dlc == 8:
+        forward, horizontal, yaw = struct.unpack_from("<hhh", payload)
+        return (
+            f"DevC chassis cmd: fwd={forward / 1000:.3f} strafe={horizontal / 1000:.3f} "
+            f"yaw={yaw / 1000:.3f} enable={payload[6]} power_limit={payload[7]} W"
+        )
+
+    if identifier == DEVC_STATUS_CAN_ID and dlc == 8:
+        suffix = "" if payload[1:] == bytes(7) else " bytes1-7=uncontracted"
+        return f"DevC status: supercap_charge={payload[0]}{suffix}"
+
+    if identifier == DEVC_ODOMETRY_CAN_ID and dlc == 8:
+        front_right, front_left, back_left, back_right = struct.unpack(">hhhh", payload)
+        return (
+            f"DevC odom: FR={front_right} FL={front_left} BL={back_left} BR={back_right} rpm"
+        )
+
+    imu_contract = DEVC_IMU_CAN_IDS.get(identifier)
+    if imu_contract is not None and dlc == 8:
+        name, scale, unit = imu_contract
+        x_raw, y_raw, z_raw = struct.unpack_from("<hhh", payload, 2)
+        return (
+            f"DevC IMU {name}: seq={payload[0]} valid=0x{payload[1]:02X} "
+            f"xyz=({x_raw * scale:.4g},{y_raw * scale:.4g},{z_raw * scale:.4g}) {unit}"
+        )
+
+    group_name = DJI_GROUP_COMMANDS.get(identifier)
+    if group_name is not None and dlc == 8:
+        outputs = struct.unpack(">hhhh", payload)
+        return f"{group_name}: raw={outputs}"
+
+    if 0x201 <= identifier <= 0x20B and dlc == 8:
+        return _decode_dji_feedback(identifier, payload)
+
+    if 0x301 <= identifier <= 0x308 and dlc == 8:
+        angle, rpm, torque = struct.unpack(">Hhh", payload[:6])
+        reserved = f" reserved=0x{payload[7]:02X}" if payload[7] else ""
+        return (
+            f"DM DJI-mode fb: angle={angle}/8192 rpm={rpm} torque_raw={torque} "
+            f"temp={payload[6]} C{reserved}"
+        )
+
+    # 0x091 is the configured MIT-mode feedback address in the searched robot
+    # configurations. Commands use a separately configured motor address.
+    if identifier == 0x091 and dlc == 8:
+        return _decode_dm_mit_feedback(payload)
+
+    if 0x141 <= identifier <= 0x160 and dlc == 8:
+        return _decode_lk_rmd(payload)
+
+    if identifier in WATTMETER_CAN_IDS and dlc == 8:
+        voltage_cv, current_ca = struct.unpack_from("<HH", payload)
+        voltage_v = voltage_cv / 100.0
+        current_a = current_ca / 100.0
+        reserved = f" reserved={payload[4:].hex(' ').upper()}" if any(payload[4:]) else ""
+        return (
+            f"60V15A wattmeter: voltage={voltage_v:.2f} V current={current_a:.2f} A "
+            f"power={voltage_v * current_a:.2f} W{reserved}"
+        )
+
+    if identifier == CM01_PMM_CAN_ID:
+        return "CM01/PMM segmented stream (waiting for a complete 8/8/8/6 message)"
+
     return ""
+
+
+# Preserve the old public helper name for callers that imported it directly.
+decode_scv2_frame = decode_can_frame
 
 
 @dataclass
@@ -219,6 +504,7 @@ class CanFrame:
     count: int = 1
     rate_times: deque[float] = field(default_factory=deque, repr=False)
     rate_hz: float = 0.0
+    stream_decoded: str = ""
 
     @property
     def address(self) -> str:
@@ -238,7 +524,9 @@ class CanFrame:
 
     @property
     def decoded(self) -> str:
-        return decode_scv2_frame(self.identifier, self.extended, self.remote, self.dlc, self.payload)
+        return self.stream_decoded or decode_can_frame(
+            self.identifier, self.extended, self.remote, self.dlc, self.payload
+        )
 
 
 class LiveCanDisplay:
@@ -256,6 +544,7 @@ class LiveCanDisplay:
         self.last_error = "--"
         self.total_frames = 0
         self.capture_health = "--"
+        self.cm01_pmm = Cm01PmmReassembler()
         self._interactive = stream.isatty()
         self.dirty = True
 
@@ -311,6 +600,11 @@ class LiveCanDisplay:
             current.last_seen = timestamp()
             current.count += 1
             current.rate_times.append(seen_monotonic)
+
+        if identifier == CM01_PMM_CAN_ID and not extended and not remote:
+            stream_decoded = self.cm01_pmm.feed(data)
+            if stream_decoded is not None:
+                current.stream_decoded = stream_decoded
 
         cutoff = seen_monotonic - 1.0
         while len(current.rate_times) > 1 and current.rate_times[0] < cutoff:
@@ -375,7 +669,14 @@ class LiveCanDisplay:
         self.dirty = False
 
 
-def monitor_decoder(device: int, dio: int, bitrate: float, refresh_hz: float, filters: set[int]) -> tuple[int, int]:
+def monitor_decoder(
+    device: int,
+    dio: int,
+    bitrate: float,
+    refresh_hz: float,
+    filters: set[int],
+    duration: float | None,
+) -> tuple[int, int]:
     dwf = load_dwf()
     configure_signatures(dwf)
 
@@ -406,6 +707,7 @@ def monitor_decoder(device: int, dio: int, bitrate: float, refresh_hz: float, fi
         display.start()
         refresh_period = 1.0 / refresh_hz
         next_refresh = time.monotonic() + refresh_period
+        stop_at = time.monotonic() + duration if duration is not None else None
 
         while True:
             require(
@@ -424,6 +726,8 @@ def monitor_decoder(device: int, dio: int, bitrate: float, refresh_hz: float, fi
                 display.add_error(status.value)
 
             now = time.monotonic()
+            if stop_at is not None and now >= stop_at:
+                return display.total_frames, sum(display.errors.values())
             if now >= next_refresh:
                 if display.dirty:
                     display.render()
@@ -449,6 +753,7 @@ def monitor_raw(
     refresh_hz: float,
     filters: set[int],
     compressed: bool,
+    duration: float | None,
 ) -> tuple[int, int]:
     """Capture batched DigitalIn samples and feed the Python CAN decoder."""
     if dio > 7:
@@ -505,6 +810,7 @@ def monitor_raw(
         decode_seconds = 0.0
         refresh_period = 1.0 / refresh_hz
         next_refresh = time.monotonic() + refresh_period
+        stop_at = time.monotonic() + duration if duration is not None else None
         display.set_capture_health(
             f"raw DigitalIn: {actual_rate / 1_000_000:g} MHz, {samples_per_bit} samples/bit, "
             f"{'compressed' if compressed else 'uncompressed'}, buffer {max_buffer.value} samples"
@@ -570,6 +876,9 @@ def monitor_raw(
                 decode_seconds += time.perf_counter() - decode_started
 
             now = time.monotonic()
+            if stop_at is not None and now >= stop_at:
+                raw_errors = total_lost + total_corrupt + decoder.bad_crc + decoder.decode_errors
+                return display.total_frames, raw_errors
             if now >= next_refresh:
                 transfer = (
                     f"compressed values {total_transfer_values} "
@@ -607,6 +916,7 @@ def monitor_raw(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--version", action="version", version=f"{APP_NAME} {APP_VERSION}")
     parser.add_argument("--device", type=int, default=-1, help="WaveForms device index (default: first device)")
     parser.add_argument("--dio", type=int, default=7, help="AD2 digital input number (default: 7)")
     parser.add_argument("--bitrate", type=float, default=1_000_000, help="CAN bitrate in bit/s (default: 1000000)")
@@ -630,6 +940,10 @@ def parse_args() -> argparse.Namespace:
         "--refresh-hz", type=float, default=24.0,
         help="maximum live-display refresh rate in Hz (default: 24)",
     )
+    parser.add_argument(
+        "--duration", type=float, default=None, metavar="SECONDS",
+        help="stop cleanly after this many seconds (default: run until Ctrl+C)",
+    )
     args = parser.parse_args()
     if not 0 <= args.dio <= 15:
         parser.error("--dio must be between 0 and 15 for an AD2")
@@ -639,6 +953,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--sample-rate must be positive")
     if args.refresh_hz <= 0:
         parser.error("--refresh-hz must be positive")
+    if args.duration is not None and args.duration <= 0:
+        parser.error("--duration must be positive")
     if any(identifier < 0 or identifier > 0x1FFFFFFF for identifier in args.filters):
         parser.error("--filter must be a CAN ID from 0 through 0x1FFFFFFF")
     args.filters = set(args.filters)
@@ -646,19 +962,28 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
+    prepare_windows_console()
     arguments = parse_args()
     try:
         if arguments.backend == "raw":
             received, errors = monitor_raw(
                 arguments.device, arguments.dio, arguments.bitrate, arguments.sample_rate,
-                arguments.refresh_hz, arguments.filters, not arguments.uncompressed,
+                arguments.refresh_hz, arguments.filters, not arguments.uncompressed, arguments.duration,
             )
             print(f"Stopped. Matching frames received: {received}; raw capture issues: {errors}.")
         else:
             received, errors = monitor_decoder(
-                arguments.device, arguments.dio, arguments.bitrate, arguments.refresh_hz, arguments.filters,
+                arguments.device, arguments.dio, arguments.bitrate, arguments.refresh_hz,
+                arguments.filters, arguments.duration,
             )
             print(f"Stopped. Matching frames received: {received}; decoder errors: {errors}.")
     except DwfError as error:
         print(f"error: {error}", file=sys.stderr)
+        # A double-clicked console would otherwise disappear before the user
+        # can read a missing-installation or device-busy error.
+        if getattr(sys, "frozen", False) and sys.stdin.isatty():
+            try:
+                input("Press Enter to close...")
+            except (EOFError, KeyboardInterrupt):
+                pass
         sys.exit(1)

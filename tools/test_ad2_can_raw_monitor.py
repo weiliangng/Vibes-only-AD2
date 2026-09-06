@@ -1,8 +1,9 @@
 import math
+import struct
 import unittest
 
 from ad2_can_raw_monitor import RawCanDecoder, crc15
-from ad2_can_monitor import expand_compressed_samples
+from ad2_can_monitor import Cm01PmmReassembler, decode_can_frame, expand_compressed_samples
 
 
 DIO = 7
@@ -190,6 +191,107 @@ class RawCanDecoderTests(unittest.TestCase):
 
         self.assertEqual(frames, [])
         self.assertEqual(decoder.candidate_ids[identifier], 1)
+
+
+class CanContractDecoderTests(unittest.TestCase):
+    def decode(self, identifier: int, payload: bytes) -> str:
+        return decode_can_frame(identifier, False, False, len(payload), payload)
+
+    def test_decodes_both_supercap_telemetry_contracts_by_dlc(self) -> None:
+        scv2 = self.decode(0x077, bytes.fromhex("02 00 06 01 22 00 00 00"))
+        legacy = self.decode(0x077, struct.pack("<fBB", 123.5, 2, 128))
+
+        self.assertIn("vcap=26.2 V", scv2)
+        self.assertIn("legacy supercap: power=123.5 W", legacy)
+        self.assertIn("error=SWEN low", legacy)
+
+    def test_decodes_inter_devc_contracts(self) -> None:
+        chassis = self.decode(0x100, struct.pack("<hhhBB", 500, -250, 1000, 1, 80))
+        odometry = self.decode(0x102, struct.pack(">hhhh", 100, -200, 300, -400))
+        imu = self.decode(0x104, bytes((7, 0x07)) + struct.pack("<hhh", 1000, -2000, 3000))
+
+        self.assertIn("fwd=0.500 strafe=-0.250 yaw=1.000 enable=1 power_limit=80 W", chassis)
+        self.assertIn("FR=100 FL=-200 BL=300 BR=-400 rpm", odometry)
+        self.assertIn("seq=7 valid=0x07 xyz=(1,-2,3) rad/s", imu)
+
+    def test_decodes_motor_group_commands_and_feedback(self) -> None:
+        command = self.decode(0x200, struct.pack(">hhhh", 1, -2, 3, -4))
+        feedback = self.decode(0x205, struct.pack(">HhhBB", 4096, -120, 55, 42, 0))
+
+        self.assertEqual(command, "DJI cmd IDs1-4: raw=(1, -2, 3, -4)")
+        self.assertIn("angle=4096/8192 rpm=-120 torque_raw=55 temp/aux=42", feedback)
+
+    def test_decodes_dm_mit_feedback(self) -> None:
+        decoded = self.decode(0x091, bytes.fromhex("21 80 00 80 08 00 30 31"))
+
+        self.assertIn("DM MIT fb: id=1 state=2", decoded)
+        self.assertIn("Tmos=48 C Tcoil=49 C", decoded)
+
+    def test_decodes_60v15a_wattmeter(self) -> None:
+        decoded = self.decode(0x213, bytes.fromhex("3F 09 05 00 00 00 00 00"))
+
+        self.assertEqual(
+            decoded,
+            "60V15A wattmeter: voltage=23.67 V current=0.05 A power=1.18 W",
+        )
+
+        # The supplied manual also identifies current and older revisions.
+        self.assertIn("voltage=23.67 V", self.decode(0x212, bytes.fromhex("3F 09 05 00 00 00 00 00")))
+        self.assertIn("voltage=23.67 V", self.decode(0x211, bytes.fromhex("3F 09 05 00 00 00 00 00")))
+
+    def test_reassembles_cm01_pmm_measurement(self) -> None:
+        packet = bytes.fromhex(
+            "5A 0D 10 90 02 65 01 00 10 00 82 43 00 09 1A "
+            "16 03 D2 41 5A 18 DB 3C 32 9D 99 3B 00 DF 73"
+        )
+        reassembler = Cm01PmmReassembler()
+
+        results = [
+            reassembler.feed(packet[0:8]),
+            reassembler.feed(packet[8:16]),
+            reassembler.feed(packet[16:24]),
+            reassembler.feed(packet[24:30]),
+        ]
+
+        self.assertEqual(results[:3], [None, None, None])
+        self.assertIn("voltage=26.252 V", results[3] or "")
+        self.assertIn("net_current=-0.0221 A (+charge)", results[3] or "")
+        self.assertIn("charge=0.0047 A discharge=0.0267 A", results[3] or "")
+        self.assertIn("route=0x0001 seq=17282", results[3] or "")
+
+    def test_cm01_reassembler_recovers_after_a_missing_fragment(self) -> None:
+        packet = bytes.fromhex(
+            "5A 0D 10 90 02 65 80 00 10 00 83 43 00 09 1A "
+            "16 03 D2 41 5A 18 DB 3C 32 9D 99 3B 00 D3 39"
+        )
+        reassembler = Cm01PmmReassembler()
+
+        reassembler.feed(packet[:8])
+        reassembler.feed(packet[8:16])  # Deliberately omit the third and fourth fragments.
+        self.assertIsNone(reassembler.feed(packet[:8]))
+        self.assertIsNone(reassembler.feed(packet[8:16]))
+        self.assertIsNone(reassembler.feed(packet[16:24]))
+        decoded = reassembler.feed(packet[24:])
+
+        self.assertIn("voltage=26.252 V", decoded or "")
+        self.assertIn("route=0x0080 seq=17283", decoded or "")
+
+    def test_cm01_reassembler_rejects_bad_message_crc(self) -> None:
+        packet = bytearray.fromhex(
+            "5A 0D 10 90 02 65 01 00 10 00 82 43 00 09 1A "
+            "16 03 D2 41 5A 18 DB 3C 32 9D 99 3B 00 DF 73"
+        )
+        packet[19] ^= 0x01
+        reassembler = Cm01PmmReassembler()
+
+        self.assertIsNone(reassembler.feed(packet[:8]))
+        self.assertIsNone(reassembler.feed(packet[8:16]))
+        self.assertIsNone(reassembler.feed(packet[16:24]))
+        self.assertIsNone(reassembler.feed(packet[24:]))
+
+    def test_does_not_guess_wrong_dlc_or_extended_frames(self) -> None:
+        self.assertEqual(decode_can_frame(0x100, False, False, 7, bytes(7)), "")
+        self.assertEqual(decode_can_frame(0x200, True, False, 8, bytes(8)), "")
 
 
 if __name__ == "__main__":
