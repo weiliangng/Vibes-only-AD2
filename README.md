@@ -40,6 +40,10 @@ CAN bus ── CAN transceiver ── RXD logic output ── AD2 DIO 7
                          logic/bus ground ─────── AD2 GND
 ```
 
+Connect the CAN transceiver VCC pin to AD2 V+ and its ground to AD2 GND. At
+startup, the monitor sets V+ to 5.0 V; V- remains disabled. The supplies are
+turned off when the monitor exits.
+
 Quick hack: connect the black can wire directly the DIO pin 7, and pray nobody has secretly swapped the pins LOL, make sure its CAN_L if you are paranoid and don't want to fry a neat bit of kit
 If the target controller exposes its CAN_RX logic signal, DIO 7 can tap that signal directly. Otherwise, use a CAN transceiver or suitable comparator as a passive receiver.
 

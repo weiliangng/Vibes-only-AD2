@@ -3,11 +3,26 @@ import struct
 import unittest
 
 from ad2_can_raw_monitor import RawCanDecoder, crc15
-from ad2_can_monitor import Cm01PmmReassembler, decode_can_frame, expand_compressed_samples
+from ad2_can_monitor import Cm01PmmReassembler, decode_can_frame, enable_vplus_supply, expand_compressed_samples
 
 
 DIO = 7
 DIO_MASK = 1 << DIO
+
+
+class RecordingAnalogIo:
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, ...]] = []
+
+    def FDwfAnalogIOEnableSet(self, _handle: object, enabled: object) -> int:
+        self.calls.append(("master", enabled.value))
+        return 1
+
+    def FDwfAnalogIOChannelNodeSet(
+        self, _handle: object, channel: object, node: object, value: object
+    ) -> int:
+        self.calls.append(("node", channel.value, node.value, value.value))
+        return 1
 
 
 def bits_of(value: int, width: int) -> list[int]:
@@ -65,6 +80,22 @@ def fractional_samples(bits: list[int], samples_per_bit: float) -> bytearray:
 
 
 class RawCanDecoderTests(unittest.TestCase):
+    def test_vplus_supply_setup_keeps_vminus_disabled(self) -> None:
+        dwf = RecordingAnalogIo()
+
+        enable_vplus_supply(dwf, object())
+
+        self.assertEqual(
+            dwf.calls,
+            [
+                ("master", 0),
+                ("node", 1, 0, 0.0),
+                ("node", 0, 1, 5.0),
+                ("node", 0, 0, 1.0),
+                ("master", 1),
+            ],
+        )
+
     def test_decodes_crc_valid_standard_frame(self) -> None:
         payload = bytes.fromhex("02 00 06 01 22 00 00 00")
         decoder = RawCanDecoder(DIO, 4)

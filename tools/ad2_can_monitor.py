@@ -66,6 +66,11 @@ RECORD_MODE = 3
 SAMPLE_FORMAT_BITS = 8
 MAX_RAW_READ_SAMPLES = 16_384
 MAX_COMPRESSED_VALUES = 16_384
+VPLUS_SUPPLY_VOLTAGE = 5.0
+VPLUS_CHANNEL = 0
+VMINUS_CHANNEL = 1
+SUPPLY_ENABLE_NODE = 0
+SUPPLY_VOLTAGE_NODE = 1
 
 # SCV2 Classic-CAN wire identifiers and payload sizes.  The packet definitions
 # live in scv2/Core/Inc/can_protocol.h and scv2/CAN_TELEMETRY.md.
@@ -170,6 +175,11 @@ def configure_signatures(dwf: ct.CDLL) -> None:
     dwf.FDwfGetLastErrorMsg.argtypes = [ct.c_char_p]
     dwf.FDwfGetLastErrorMsg.restype = ct.c_int
 
+    dwf.FDwfAnalogIOEnableSet.argtypes = [handle, ct.c_int]
+    dwf.FDwfAnalogIOEnableSet.restype = ct.c_int
+    dwf.FDwfAnalogIOChannelNodeSet.argtypes = [handle, ct.c_int, ct.c_int, ct.c_double]
+    dwf.FDwfAnalogIOChannelNodeSet.restype = ct.c_int
+
     dwf.FDwfDigitalCanReset.argtypes = [handle]
     dwf.FDwfDigitalCanReset.restype = ct.c_int
     dwf.FDwfDigitalCanRateSet.argtypes = [handle, ct.c_double]
@@ -222,6 +232,33 @@ def error_message(dwf: ct.CDLL) -> str:
 def require(ok: int, dwf: ct.CDLL, operation: str) -> None:
     if not ok:
         raise DwfError(f"{operation} failed: {error_message(dwf)}")
+
+
+def enable_vplus_supply(dwf: ct.CDLL, handle: ct.c_int) -> None:
+    """Power the CAN transceiver from AD2 V+ while keeping V- disabled."""
+    require(dwf.FDwfAnalogIOEnableSet(handle, ct.c_int(0)), dwf, "disable power supplies for setup")
+    require(
+        dwf.FDwfAnalogIOChannelNodeSet(
+            handle, ct.c_int(VMINUS_CHANNEL), ct.c_int(SUPPLY_ENABLE_NODE), ct.c_double(0)
+        ),
+        dwf,
+        "keep V- supply disabled",
+    )
+    require(
+        dwf.FDwfAnalogIOChannelNodeSet(
+            handle, ct.c_int(VPLUS_CHANNEL), ct.c_int(SUPPLY_VOLTAGE_NODE), ct.c_double(VPLUS_SUPPLY_VOLTAGE)
+        ),
+        dwf,
+        "set V+ supply to 5 V",
+    )
+    require(
+        dwf.FDwfAnalogIOChannelNodeSet(
+            handle, ct.c_int(VPLUS_CHANNEL), ct.c_int(SUPPLY_ENABLE_NODE), ct.c_double(1)
+        ),
+        dwf,
+        "enable V+ supply channel",
+    )
+    require(dwf.FDwfAnalogIOEnableSet(handle, ct.c_int(1)), dwf, "turn on V+ supply")
 
 
 @lru_cache(maxsize=8)
@@ -777,8 +814,9 @@ def monitor_decoder(
         raise DwfError(f"open Analog Discovery 2 failed: {error_message(dwf)}")
 
     display = LiveCanDisplay(sys.stdout, bitrate, dio, filters)
-    display.set_capture_health("WaveForms CAN decoder (single-frame API; may drop traffic on a busy bus)")
+    display.set_capture_health("V+ 5.0 V; WaveForms CAN decoder (single-frame API; may drop traffic on a busy bus)")
     try:
+        enable_vplus_supply(dwf, handle)
         require(dwf.FDwfDigitalCanReset(handle), dwf, "reset CAN decoder")
         require(dwf.FDwfDigitalCanRateSet(handle, ct.c_double(bitrate)), dwf, "set CAN bitrate")
         # Normal CAN logic polarity: recessive high, dominant low.
@@ -832,6 +870,7 @@ def monitor_decoder(
         if display.dirty:
             display.render()
         display.close()
+        dwf.FDwfAnalogIOEnableSet(handle, ct.c_int(0))
         dwf.FDwfDeviceClose(handle)
 
 
@@ -862,6 +901,7 @@ def monitor_raw(
     total_samples = total_transfer_values = total_lost = total_corrupt = 0
     decoder: RawCanDecoder | None = None
     try:
+        enable_vplus_supply(dwf, handle)
         base_rate = ct.c_double()
         max_buffer = ct.c_int()
         require(dwf.FDwfDigitalInReset(handle), dwf, "reset DigitalIn")
@@ -902,7 +942,7 @@ def monitor_raw(
         next_refresh = time.monotonic() + refresh_period
         stop_at = time.monotonic() + duration if duration is not None else None
         display.set_capture_health(
-            f"raw DigitalIn: {actual_rate / 1_000_000:g} MHz, {samples_per_bit} samples/bit, "
+            f"V+ 5.0 V; raw DigitalIn: {actual_rate / 1_000_000:g} MHz, {samples_per_bit} samples/bit, "
             f"{'compressed' if compressed else 'uncompressed'}, buffer {max_buffer.value} samples"
         )
         display.start()
@@ -982,7 +1022,7 @@ def monitor_raw(
                 valid_yield = 100.0 * valid_frames / max(1, valid_frames + rejected_frames)
                 fallback_hits = sum(decoder.phase_hits.values())
                 display.set_capture_health(
-                    f"raw {actual_rate / 1_000_000:g} MHz; expanded samples {total_samples}; {transfer}\n"
+                    f"V+ 5.0 V; raw {actual_rate / 1_000_000:g} MHz; expanded samples {total_samples}; {transfer}\n"
                     f"continuity: lost {total_lost}; corrupt {total_corrupt}; bad CRC {decoder.bad_crc}; "
                     f"decode errors {decoder.decode_errors}; candidate yield {valid_yield:.1f}%\n"
                     f"decoder: load {decode_load:.0f}%; resyncs {decoder.resyncs}; "
@@ -1001,6 +1041,7 @@ def monitor_raw(
             display.render()
         display.close()
         dwf.FDwfDigitalInConfigure(handle, ct.c_int(1), ct.c_int(0))
+        dwf.FDwfAnalogIOEnableSet(handle, ct.c_int(0))
         dwf.FDwfDeviceClose(handle)
 
 
