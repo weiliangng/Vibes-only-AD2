@@ -229,10 +229,12 @@ class CanContractDecoderTests(unittest.TestCase):
         return decode_can_frame(identifier, False, False, len(payload), payload)
 
     def test_decodes_both_supercap_telemetry_contracts_by_dlc(self) -> None:
-        scv2 = self.decode(0x077, bytes.fromhex("02 00 06 01 22 00 00 00"))
+        scv2 = self.decode(0x077, bytes.fromhex("02 00 06 01 22 00 00 04"))
         legacy = self.decode(0x077, struct.pack("<fBB", 123.5, 2, 128))
 
         self.assertIn("vcap=26.2 V", scv2)
+        self.assertIn("iout=3.4 A", scv2)
+        self.assertIn("cmd=fresh", scv2)
         self.assertIn("legacy supercap: power=123.5 W", legacy)
         self.assertIn("error=SWEN low", legacy)
 

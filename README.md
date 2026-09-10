@@ -107,7 +107,7 @@ The live view above shows a sustained busy-bus capture with zero lost or corrupt
 ```text
 CAN packets by address (6 unique, 78483 total)
 Address  Format Type DLC Data                     Last received  CRC Hz Header Hz Frames Decoded
-0x077    STD    DATA   8 00 00 06 01 23 00 00 00 02:05:32.778    717.9    ...     24740 SCV2 telemetry...
+0x077    STD    DATA   8 00 00 06 01 23 00 00 00 02:05:32.778    717.9    ...     24740 SCV2/Faster telemetry...
 ```
 
 | Display item | Meaning |
@@ -135,8 +135,8 @@ IDs are 11-bit standard Classic CAN unless stated otherwise. The same numeric ID
 
 | CAN ID | DLC | Meaning currently decoded |
 |---|---:|---|
-| `0x067` | 5 | SCV2 command: enable, reset, power limit in watts and energy target in joules. |
-| `0x077` | 8 | SCV2 telemetry: load power, capacitor voltage, converter current and fault flags. |
+| `0x067` | 5 | SCV2/Faster command: enable, reset, power limit in watts and energy target in joules. |
+| `0x077` | 8 | SCV2/Faster telemetry: load power, capacitor voltage, measured converter output current, command freshness and fault flags. |
 | `0x077` | 6 | Legacy Faster_Supercap telemetry: chassis power, error and normalized energy. DLC distinguishes it from SCV2. |
 | `0x091` | 8 | DM motor MIT-mode feedback at the address used by the searched local robot configurations: state, motor ID, position, velocity, torque and temperatures. |
 | `0x100` | 8 | Inter-DevC chassis command: forward, strafe, yaw, enable and power limit. |

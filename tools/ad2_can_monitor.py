@@ -514,10 +514,10 @@ def decode_can_frame(identifier: int, extended: bool, remote: bool, dlc: int, pa
     if identifier == SCV2_COMMAND_CAN_ID and dlc == SCV2_COMMAND_DLC and len(payload) == SCV2_COMMAND_DLC:
         enable_module, reset, power_limit_w, energy_j = struct.unpack("<BBBH", payload)
         energy = "disabled (777 J)" if energy_j == 777 else f"{energy_j} J"
-        return f"SCV2 cmd: enable={enable_module} reset=0x{reset:02X} power={power_limit_w} W energy={energy}"
+        return f"SCV2/Faster cmd: enable={enable_module} reset=0x{reset:02X} power={power_limit_w} W energy={energy}"
 
     if identifier == SCV2_TELEMETRY_CAN_ID and dlc == SCV2_TELEMETRY_DLC and len(payload) == SCV2_TELEMETRY_DLC:
-        load_power_dw, vcap_dv, converter_current_da = struct.unpack_from("<HHh", payload)
+        load_power_dw, vcap_dv, output_current_da = struct.unpack_from("<HHh", payload)
         status = payload[7]
         faults = []
         if status & 0x01:
@@ -525,13 +525,15 @@ def decode_can_frame(identifier: int, extended: bool, remote: bool, dlc: int, pa
         if status & 0x02:
             faults.append("Vcap OVP")
         fault_text = ", ".join(faults) if faults else "none"
-        reserved_status = status & ~0x03
+        command_link = "fresh" if status & 0x04 else "stale"
+        reserved_status = status & ~0x07
         if reserved_status:
             fault_text += f"; reserved=0x{reserved_status:02X}"
         reserved_byte = f" reserved=0x{payload[6]:02X}" if payload[6] else ""
         return (
-            f"SCV2 telemetry: load={load_power_dw / 10:.1f} W vcap={vcap_dv / 10:.1f} V "
-            f"iconv={converter_current_da / 10:.1f} A faults={fault_text}{reserved_byte}"
+            f"SCV2/Faster telemetry: load={load_power_dw / 10:.1f} W vcap={vcap_dv / 10:.1f} V "
+            f"iout={output_current_da / 10:.1f} A cmd={command_link} "
+            f"faults={fault_text}{reserved_byte}"
         )
 
     # Faster_Supercap's legacy 0x077 contract is unambiguous by its DLC 6.
